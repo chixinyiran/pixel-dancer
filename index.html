@@ -286,15 +286,20 @@ var BUILTINAAC=["data:audio/mp4;base64,AAAAHGZ0eXBNNEEgAAACAE00QSBpc29taXNvMgAAA
 /* [iOS-FIX] iOS Safari / 微信内置浏览器不支持 WebM/Opus 解码 → 内置歌曲改用 <audio> 标签播 AAC。
    检测：无法解码 Opus 的环境一律走 AAC <audio> 路径，并复用 userAudio 同款对拍机制。 */
 var IS_IOS = (function(){
+  /* [ANDROID-FIX] 关键修复：之前 inApp 检测命中安卓微信，让其走 AAC <audio> 路径，
+     但安卓微信 X5 内核对 data URI m4a 兼容差，play() 卡死不响应。
+     正确做法：只有真 iOS 设备（含 iOS 微信、iOS Safari）才走 AAC 路径；
+     安卓所有内置浏览器（包括安卓微信）都走 Web Audio + Opus，X5 内核原生支持 Opus。 */
   var ua = navigator.userAgent || '';
   var iOSDevice = /iP(hone|od|ad)/.test(ua);
-  // iPadOS 13+ 伪装成 Mac，用触屏点数判断
+  // iPadOS 13+ 伪装成 Mac
   var iPadOS = (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-  // 微信/QQ 内置浏览器
-  var inApp = /MicroMessenger|QQ\//i.test(ua);
-  // Safari 桌面也对 Opus 支持差
-  var isSafari = /^((?!chrome|android).)*safari/i.test(ua);
-  return iOSDevice || iPadOS || (inApp) || isSafari;
+  // 安卓识别（用来排除）
+  var isAndroid = /Android/i.test(ua);
+  // 桌面 Safari（不含 iOS, 不含 Chrome）
+  var isDesktopSafari = !isAndroid && !iOSDevice && /Safari/.test(ua) && !/Chrome|Chromium|Edg|OPR/.test(ua);
+  // 走 iOS/AAC 路径的条件：真 iOS 设备 OR iPadOS OR 桌面 Safari（Opus 解码也差）
+  return iOSDevice || iPadOS || isDesktopSafari;
 })();
 var builtinAudio = null;   // 内置歌曲的 <audio> 播放器（iOS 路径）
 function _stopBuiltinAudio(){ if(builtinAudio){ try{builtinAudio.pause();}catch(e){} builtinAudio=null; } }
