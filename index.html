@@ -63,8 +63,8 @@
     white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
   }
   .trk:hover{border-color:#999;color:#fff}
-  .trk.on{background:#fff;color:#000;border-color:#fff;box-shadow:0 0 18px rgba(255,255,255,.45)}
-  .trk.on small{color:#333}
+  .trk.on{background:transparent;color:#fff;border-color:#fff;font-weight:700}
+  .trk.on small{color:#bbb;font-weight:400}
   .btn{
     font-family:inherit;font-size:15px;
     background:#000;color:#fff;border:2px solid #777;
@@ -301,16 +301,63 @@ function stopReal(){
   if(realGain){ try{ realGain.disconnect(); }catch(e){} realGain=null; }
 }
 var SONGNAMES = ["BILLIE JEAN","BEAT IT","SMOOTH CRIMINAL","THRILLER"];
+var _coverCache = {};
+function _makeCover(idx){
+  /* [COVER] 生成 MOONWALKER 风格锁屏封面: 黑底+星空+月亮+像素MJ剪影, canvas→PNG data URL */
+  if(_coverCache[idx]) return _coverCache[idx];
+  try{
+    var S=512, cv=document.createElement('canvas'); cv.width=S; cv.height=S;
+    var g=cv.getContext('2d');
+    /* 黑色夜空底 + 顶部冷白辉光 */
+    g.fillStyle='#000'; g.fillRect(0,0,S,S);
+    var halo=g.createRadialGradient(S*0.72,S*0.22,8,S*0.72,S*0.22,S*0.55);
+    halo.addColorStop(0,'rgba(255,255,255,0.30)'); halo.addColorStop(0.5,'rgba(180,190,210,0.08)'); halo.addColorStop(1,'rgba(0,0,0,0)');
+    g.fillStyle=halo; g.fillRect(0,0,S,S);
+    /* 星点(确定性伪随机) */
+    var seed=1234+idx*97; function rnd(){ seed=(seed*9301+49297)%233280; return seed/233280; }
+    for(var i=0;i<70;i++){ var sx=rnd()*S, sy=rnd()*S*0.6, sr=rnd()*1.6+0.4; g.globalAlpha=rnd()*0.7+0.2; g.fillStyle='#fff'; g.fillRect(sx,sy,sr+1,sr+1); }
+    g.globalAlpha=1;
+    /* 月亮(右上, 黑白像素风: 亮盘+暗咬影) */
+    g.fillStyle='#cfcfcf'; g.beginPath(); g.arc(S*0.74,S*0.20,S*0.085,0,6.2832); g.fill();
+    g.fillStyle='#000'; g.beginPath(); g.arc(S*0.70,S*0.175,S*0.078,0,6.2832); g.fill();
+    /* 用主舞者引擎渲染一帧招牌 pose 作剪影(黑白) */
+    try{
+      var fc=document.createElement('canvas'), SS=4; fc.width=W*SS; fc.height=H*SS;
+      var fx=fc.getContext('2d');
+      var _X=X, _save={}; for(var n in pose){ _save[n]=[pose[n][0],pose[n][1]]; }
+      X=fx; fx.setTransform(SS,0,0,SS,0,0);
+      try{ if(typeof curTrack!=='undefined'){} drawFigure(W*0.5, 1, idx*40+10); }catch(e){}
+      X=_X; for(var n2 in _save){ if(pose[n2]){ pose[n2][0]=_save[n2][0]; pose[n2][1]=_save[n2][1]; } }
+      /* 贴入封面: 人物居中偏下 */
+      var dw=S*0.62, dh=dw*(fc.height/fc.width);
+      g.drawImage(fc, S*0.5-dw/2, S*0.95-dh, dw, dh);
+    }catch(e){}
+    /* 地面线 */
+    g.strokeStyle='rgba(150,150,150,0.5)'; g.lineWidth=2; g.beginPath(); g.moveTo(0,S*0.93); g.lineTo(S,S*0.93); g.stroke();
+    /* 曲名 + MOONWALKER 字样 */
+    g.fillStyle='#fff'; g.textAlign='center';
+    g.font='bold 38px -apple-system,sans-serif';
+    g.fillText(SONGNAMES[idx]||'MOONWALKER', S*0.5, S*0.55);
+    g.fillStyle='rgba(255,255,255,0.45)'; g.font='600 18px -apple-system,sans-serif';
+    g.fillText('MOONWALKER', S*0.5, S*0.62);
+    var url=cv.toDataURL('image/png');
+    _coverCache[idx]=url;
+    return url;
+  }catch(e){ return null; }
+}
 function _updateMediaSession(){
-  /* [BG] MediaSession: 告诉系统"正在播放媒体", 防止浏览器激进挂起后台音频(后台沙沙声/停播根因);
-     并提供锁屏/通知栏播放控件 */
   if(!('mediaSession' in navigator)) return;
   try{
-    navigator.mediaSession.metadata = new MediaMetadata({
+    var cover=_makeCover(curTrack);
+    var meta={
       title: SONGNAMES[curTrack] || "MOONWALKER",
       artist: "像素 MJ",
-      album: "MOONWALKER · Web Audio"
-    });
+      album: "MOONWALKER"
+    };
+    if(cover) meta.artwork=[
+      {src:cover,sizes:'512x512',type:'image/png'}
+    ];
+    navigator.mediaSession.metadata = new MediaMetadata(meta);
     navigator.mediaSession.playbackState = playing ? "playing" : "paused";
     navigator.mediaSession.setActionHandler('play', function(){ if(!playing) setPlaying(true); });
     navigator.mediaSession.setActionHandler('pause', function(){ if(playing) setPlaying(false); });
@@ -704,15 +751,15 @@ function buildBG(){
     b.fillStyle = rnd() < .22 ? "#fff" : (rnd()<.5 ? "#a8a8a8" : "#585858");
     b.fillRect((rnd()*W)|0, (rnd()*118)|0, 1, 1);
   }
-  /* 生成 20 颗闪烁星: 位置/亮颜色/相位/速率(每颗不同周期,自然随机) */
+  /* [STRONG] 生成 32 颗闪烁星(原20): 加大幅度/加快频率, 眨眼更明显 */
   TWINKLE = [];
-  for (var ti=0; ti<20; ti++){
+  for (var ti=0; ti<32; ti++){
     TWINKLE.push({
       x: (rnd()*W)|0,
-      y: (rnd()*110)|0,
-      base: rnd() < .35 ? 1.0 : 0.7,        // 亮度基础
-      amp: 0.35 + rnd()*0.55,               // 闪烁幅度
-      speed: 0.6 + rnd()*2.4,               // 频率(rad/s)
+      y: (rnd()*112)|0,
+      base: rnd() < .45 ? 0.95 : 0.5,       // 亮度基础(降低暗星基础→对比更大→眨得更明显)
+      amp: 0.55 + rnd()*0.75,               // [STRONG] 闪烁幅度 0.55~1.3(原0.35~0.9), 摆动更大
+      speed: 1.2 + rnd()*3.8,               // [STRONG] 频率 1.2~5.0(原0.6~3.0), 眨得更快
       phase: rnd() * 6.2832,                // 起始相位
       bigChance: rnd()                      // 用来判断是否偶尔放大成 2x2(亮的星)
     });
@@ -1199,20 +1246,26 @@ function frame(){
     var tNow = (typeof performance!=='undefined' ? performance.now() : Date.now()) * 0.001;
     for (var ti=0; ti<TWINKLE.length; ti++){
       var s = TWINKLE[ti];
-      var v = s.base + s.amp * Math.sin(tNow * s.speed + s.phase);   // 亮度 0~1
+      var v = s.base + s.amp * Math.sin(tNow * s.speed + s.phase);   // 亮度
       v = Math.max(0, Math.min(1, v));
-      var alpha = (v*0.95).toFixed(3);
-      // 亮度越高越白; 极暗时不画 (自然消失感)
-      if (v < 0.08) continue;
-      X.fillStyle = v > 0.75 ? "rgba(255,255,255,"+alpha+")" : (v > 0.4 ? "rgba(220,220,220,"+alpha+")" : "rgba(140,140,140,"+alpha+")");
+      // [STRONG] 极暗时完全熄灭(范围更大→明显的"睁眼闭眼"); 暗于0.18直接不画
+      if (v < 0.18) continue;
+      var alpha = (v*v).toFixed(3);   // [STRONG] 平方曲线: 亮处更亮暗处更暗, 对比强烈
+      X.fillStyle = v > 0.7 ? "rgba(255,255,255,"+alpha+")" : (v > 0.4 ? "rgba(225,225,225,"+alpha+")" : "rgba(150,150,150,"+alpha+")");
       X.fillRect(s.x, s.y, 1, 1);
-      // 偶尔出现的"亮星":高峰时画十字光芒
-      if (v > 0.92 && s.bigChance > 0.6){
-        X.fillStyle = "rgba(255,255,255,"+(alpha*0.55)+")";
+      // [STRONG] 亮星十字光芒: 阈值降到 0.8(原0.92)、概率放宽(原0.6→0.45), 更频繁出现
+      if (v > 0.8 && s.bigChance > 0.45){
+        X.fillStyle = "rgba(255,255,255,"+(alpha*0.7).toFixed(3)+")";
         X.fillRect(s.x-1, s.y, 1, 1);
         X.fillRect(s.x+1, s.y, 1, 1);
         X.fillRect(s.x, s.y-1, 1, 1);
         X.fillRect(s.x, s.y+1, 1, 1);
+        // [STRONG] 峰值时再加对角微光, 像真的闪一下
+        if (v > 0.95){
+          X.fillStyle = "rgba(255,255,255,"+(alpha*0.4).toFixed(3)+")";
+          X.fillRect(s.x-1, s.y-1, 1, 1); X.fillRect(s.x+1, s.y-1, 1, 1);
+          X.fillRect(s.x-1, s.y+1, 1, 1); X.fillRect(s.x+1, s.y+1, 1, 1);
+        }
       }
     }
   }
