@@ -298,14 +298,38 @@ var IS_IOS = (function(){
 })();
 var builtinAudio = null;   // 内置歌曲的 <audio> 播放器（iOS 路径）
 function _stopBuiltinAudio(){ if(builtinAudio){ try{builtinAudio.pause();}catch(e){} builtinAudio=null; } }
+var SONGNAMES = ["BILLIE JEAN","BEAT IT","SMOOTH CRIMINAL","THRILLER"];
+function _switchTrack(i){
+  /* [BG-FIX] 供 MediaSession 上/下一首调用：模拟点击对应曲目按钮 */
+  var btns = document.querySelectorAll('.trk');
+  if (btns[i]) btns[i].click();
+}
+function _setupMediaSession(i){
+  /* [BG-FIX] MediaSession：锁屏/控制中心显示播放控件，并让 iOS 更倾向于保持后台音频存活 */
+  if (!('mediaSession' in navigator)) return;
+  try{
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: SONGNAMES[i] || "MOONWALKER",
+      artist: "像素 MJ · Web Audio",
+      album: "MOONWALKER"
+    });
+    navigator.mediaSession.setActionHandler('play', function(){ setPlaying(true); });
+    navigator.mediaSession.setActionHandler('pause', function(){ setPlaying(false); });
+    navigator.mediaSession.setActionHandler('previoustrack', function(){ _switchTrack((curTrack+3)%4); });
+    navigator.mediaSession.setActionHandler('nexttrack', function(){ _switchTrack((curTrack+1)%4); });
+    navigator.mediaSession.playbackState = 'playing';
+  }catch(e){}
+}
 function playBuiltinAAC(i, offset){
   _stopBuiltinAudio();
   builtinAudio = new Audio(BUILTINAAC[i]);
   builtinAudio.loop = true;
   builtinAudio.volume = volEl.value / 100;
   builtinAudio.currentTime = offset || 0;
+  builtinAudio.setAttribute('playsinline','');   /* [BG-FIX] iOS 内联播放 */
   var pr = builtinAudio.play();
   if (pr && pr.catch) pr.catch(function(){ /* autoplay 被拦：等下次手势 */ });
+  _setupMediaSession(i);
 }
 var realBuf=[null,null,null,null], realSrc=null, realStart=0, realDur=0, realReq=0, realFailed=false;
 function _b64ToBytes(uri){ var c=uri.indexOf(','); var bin=atob(uri.substring(c+1)); var b=new Uint8Array(bin.length); for(var i=0;i<bin.length;i++) b[i]=bin.charCodeAt(i); return b; }
@@ -898,6 +922,7 @@ function setPlaying(v){
   } else {
     if (schedTimer){ clearInterval(schedTimer); schedTimer = 0; }
     if (builtinAudio){ try{builtinAudio.pause();}catch(e){} }   /* [iOS-FIX] 暂停内置 AAC */
+    if ('mediaSession' in navigator){ try{ navigator.mediaSession.playbackState='paused'; }catch(e){} }
     if (ctx) ctx.suspend();
   }
 }
@@ -980,8 +1005,23 @@ document.addEventListener("visibilitychange", function(){
     if (playing && ctx && ctx.state === "suspended"){ try { ctx.resume(); } catch(e){} }
   } else {
     if (playing && ctx && ctx.state === "suspended"){ try { ctx.resume(); } catch(e){} }
+    /* [BG-FIX] iOS 回前台：<audio> 被系统暂停了 → 自动续播（无需手动再点） */
+    if (playing && builtinAudio && builtinAudio.paused){
+      var pr = builtinAudio.play(); if (pr && pr.catch) pr.catch(function(){});
+    }
+    if (playing && userAudio && userAudio.paused){
+      var pr2 = userAudio.play(); if (pr2 && pr2.catch) pr2.catch(function(){});
+    }
     startLoop();   // 回前台重新拉起动画循环（后台时 RAF 不触发）
   }
+});
+/* [BG-FIX] 多重保险：pageshow（从 bfcache 恢复）/ focus 时也尝试续播 */
+window.addEventListener("pageshow", function(){
+  if (playing && builtinAudio && builtinAudio.paused){ var p=builtinAudio.play(); if(p&&p.catch)p.catch(function(){}); }
+  startLoop();
+});
+window.addEventListener("focus", function(){
+  if (playing && builtinAudio && builtinAudio.paused){ var p=builtinAudio.play(); if(p&&p.catch)p.catch(function(){}); }
 });
 /* 键盘快捷键：空格 播放/暂停，1-4 切歌 */
 document.addEventListener("keydown", function(ev){
