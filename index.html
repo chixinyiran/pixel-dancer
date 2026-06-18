@@ -284,14 +284,78 @@ var SONGAUDIO=[
 ];
 var realBuf=[null,null,null,null], realSrc=null, realStart=0, realDur=0, realReq=0, realFailed=false;
 function _b64ToBytes(uri){ var c=uri.indexOf(','); var bin=atob(uri.substring(c+1)); var b=new Uint8Array(bin.length); for(var i=0;i<bin.length;i++) b[i]=bin.charCodeAt(i); return b; }
-function stopReal(){ if(realSrc){ try{ realSrc.onended=null; realSrc.stop(); }catch(e){} try{ realSrc.disconnect(); }catch(e){} realSrc=null; } }
+/* [FEAT] 自动连播 + crossfade: 替换原单曲循环
+   原代码 realSrc.loop=true 在 30s 末尾跳回开头时,因为首尾峰值高(-0.3~-3.5dB),
+   波形不连续会产生周期性爆音(被感知为"沙沙声/卡顿"). 改为:
+   1. 不 loop, 取消爆音源
+   2. 接近末尾(剩 0.6s)时调度下一首,用 GainNode 做 0.6s 交叉淡入淡出
+   3. 一首完整放完后自动播下一首 (curTrack=(curTrack+1)%4) */
+var XFADE = 0.6;       // 交叉淡入淡出时长(秒)
+var nextTimer = 0;     // 下一首调度 setTimeout 句柄
+var realGain = null;   // 当前曲目独立 gain (用于淡出)
+function _clearNextTimer(){ if(nextTimer){ clearTimeout(nextTimer); nextTimer=0; } }
+function stopReal(){
+  _clearNextTimer();
+  if(realSrc){ try{ realSrc.onended=null; realSrc.stop(); }catch(e){} try{ realSrc.disconnect(); }catch(e){} realSrc=null; }
+  if(realGain){ try{ realGain.disconnect(); }catch(e){} realGain=null; }
+}
 function _startRealBuf(buf, offset){
   stopReal();
   realDur = buf.duration||1;
-  realSrc = ctx.createBufferSource(); realSrc.buffer=buf; realSrc.loop=true; realSrc.connect(master);
+  realSrc = ctx.createBufferSource();
+  realSrc.buffer = buf;
+  realSrc.loop = false;   /* [FEAT] 关闭单曲循环, 改自动连播 */
+  realGain = ctx.createGain();
+  realGain.gain.value = 1.0;
+  realSrc.connect(realGain).connect(master);
   var off=(((offset||0)%realDur)+realDur)%realDur;
   realStart = ctx.currentTime - off;
-  realSrc.onended=function(){ if(playing && !userAudio && realSrc===this){ _startRealBuf(buf, 0); } };
+  /* 调度下一首: 在剩余时间 - XFADE 时切, 实现交叉淡入淡出 */
+  var remain = realDur - off;
+  var fireMs = Math.max(50, (remain - XFADE) * 1000);
+  nextTimer = setTimeout(function(){
+    if(!playing || userAudio) return;
+    if(realSrc !== thisSrc) return;   /* 已被切歌取消 */
+    /* 当前曲淡出 */
+    try{
+      var t=ctx.currentTime;
+      realGain.gain.setValueAtTime(realGain.gain.value, t);
+      realGain.gain.linearRampToValueAtTime(0, t + XFADE);
+    }catch(e){}
+    /* 启动下一首 (淡入由 _startRealBuf 内创建的新 realGain 默认从 1 开始,改为从 0 渐入) */
+    var nextIdx = (curTrack + 1) % 4;
+    curTrack = nextIdx;
+    /* 同步 UI: 高亮新曲目按钮 */
+    try{
+      var btns = document.querySelectorAll('.trk');
+      for(var k=0;k<btns.length;k++) btns[k].className = 'trk';
+      if(btns[nextIdx]) btns[nextIdx].className = 'trk on';
+    }catch(e){}
+    /* 调用 playReal 启动下一首, 但需要让它淡入而非直接 1.0 */
+    _crossfadeIn = true;
+    playReal(nextIdx, 0);
+  }, fireMs);
+  /* 备用 onended: 万一调度漏掉,自然结束也切下一首 (非循环, 这条是兜底) */
+  var thisSrc = realSrc;
+  realSrc.onended = function(){
+    if(!playing || userAudio || realSrc !== this) return;
+    if(nextTimer) return;   /* 调度已生效, 跳过 */
+    var nextIdx = (curTrack + 1) % 4;
+    curTrack = nextIdx;
+    try{
+      var btns = document.querySelectorAll('.trk');
+      for(var k=0;k<btns.length;k++) btns[k].className = 'trk';
+      if(btns[nextIdx]) btns[nextIdx].className = 'trk on';
+    }catch(e){}
+    playReal(nextIdx, 0);
+  };
+  /* 如果是 crossfade 进入, gain 从 0 渐入 */
+  if (window._crossfadeIn) {
+    var t=ctx.currentTime;
+    realGain.gain.setValueAtTime(0, t);
+    realGain.gain.linearRampToValueAtTime(1, t + XFADE);
+    window._crossfadeIn = false;
+  }
   try{ realSrc.start(0, off); }catch(e){ try{ realSrc.start(0); }catch(e2){} }
 }
 function playReal(i, offset){
@@ -535,6 +599,7 @@ function evalRoutine(beats){
 
 /* ============ 静态背景：星空 + 月亮 + 地砖网格（每次换分辨率时预渲染一次） ============ */
 var BG = document.createElement("canvas");
+var TWINKLE = [];   /* [FEAT] 闪烁星数据数组 */
 function buildBG(){
   BG.width = Math.round(W*RES); BG.height = Math.round(H*RES);
   var b = BG.getContext("2d");
@@ -542,9 +607,23 @@ function buildBG(){
   b.fillStyle = "#000"; b.fillRect(0,0,W,H);
   var s = 7;
   function rnd(){ s = (s*16807) % 2147483647; return s/2147483647; }
-  for (var i=0;i<95;i++){
+  /* [FEAT] 静态星星 75 颗 + 闪烁星 20 颗(存入 TWINKLE 数组,frame() 动态画) */
+  for (var i=0;i<75;i++){
     b.fillStyle = rnd() < .22 ? "#fff" : (rnd()<.5 ? "#a8a8a8" : "#585858");
     b.fillRect((rnd()*W)|0, (rnd()*118)|0, 1, 1);
+  }
+  /* 生成 20 颗闪烁星: 位置/亮颜色/相位/速率(每颗不同周期,自然随机) */
+  TWINKLE = [];
+  for (var ti=0; ti<20; ti++){
+    TWINKLE.push({
+      x: (rnd()*W)|0,
+      y: (rnd()*110)|0,
+      base: rnd() < .35 ? 1.0 : 0.7,        // 亮度基础
+      amp: 0.35 + rnd()*0.55,               // 闪烁幅度
+      speed: 0.6 + rnd()*2.4,               // 频率(rad/s)
+      phase: rnd() * 6.2832,                // 起始相位
+      bigChance: rnd()                      // 用来判断是否偶尔放大成 2x2(亮的星)
+    });
   }
   b.fillStyle = "#a8a8a8";
   b.beginPath(); b.arc(278, 30, 11, 0, 6.2832); b.fill();
@@ -867,6 +946,7 @@ function setPlaying(v){
     }
   } else {
     if (schedTimer){ clearInterval(schedTimer); schedTimer = 0; }
+    _clearNextTimer();   /* [FEAT] 暂停时清下一首调度,避免暂停后还自动切歌 */
     if (ctx) ctx.suspend();
   }
 }
@@ -886,7 +966,7 @@ for (var ti=0; ti<trkBtns.length; ti++){
     for (var k=0;k<trkBtns.length;k++) trkBtns[k].className = "trk";
     this.className = "trk on";
     curTrack = i;                   // 切歌：从头起拍
-    if (!userAudio && !realFailed) stopReal();   // 丢弃旧曲音源，确保切到新曲（暂停时切歌也正确）
+    if (!userAudio && !realFailed) stopReal();   // 丢弃旧曲音源(stopReal 内已清理 nextTimer)
     if (!playing) setPlaying(true);
     else if (userAudio) { /* 导入模式：单一音源 */ }
     else if (realFailed) startClock();           // 合成器模式：重置拍点
@@ -937,12 +1017,24 @@ for (var ri=0; ri<resBtns.length; ri++){
    - 浏览器若擅自 suspend 了 AudioContext，回前台时再 resume，避免静音。
    动画(requestAnimationFrame)在后台本就不触发，回前台由下方 startLoop 自动拉起。 */
 document.addEventListener("visibilitychange", function(){
+  /* [FEAT] 切后台保持播放: 不主动 suspend ctx, 只省 rAF;
+     回前台 resume(防系统自动 suspend)+ 拉 rAF + 续播被系统暂停的 audio */
   if (document.hidden){
-    if (playing && ctx && ctx.state === "suspended"){ try { ctx.resume(); } catch(e){} }
+    /* 后台: 让浏览器自己节流 rAF, 不动音频. 不调 suspend, 让音频继续走 */
   } else {
     if (playing && ctx && ctx.state === "suspended"){ try { ctx.resume(); } catch(e){} }
-    startLoop();   // 回前台重新拉起动画循环（后台时 RAF 不触发）
+    if (playing && userAudio && userAudio.paused){ try { userAudio.play(); } catch(e){} }
+    startLoop();
   }
+});
+/* [FEAT] 多重保险: pageshow / focus 也尝试续播 */
+window.addEventListener("pageshow", function(){
+  if (playing && ctx && ctx.state === "suspended"){ try { ctx.resume(); } catch(e){} }
+  if (playing && userAudio && userAudio.paused){ try { userAudio.play(); } catch(e){} }
+  startLoop();
+});
+window.addEventListener("focus", function(){
+  if (playing && ctx && ctx.state === "suspended"){ try { ctx.resume(); } catch(e){} }
 });
 /* 键盘快捷键：空格 播放/暂停，1-4 切歌 */
 document.addEventListener("keydown", function(ev){
@@ -994,6 +1086,28 @@ function frame(){
   X.setTransform(1,0,0,1,0,0);
   X.drawImage(BG, 0, 0);
   X.setTransform(RES,0,0,RES,0,0);   // 之后全部按 320×180 逻辑坐标作画
+  /* [FEAT] 闪烁星: 每帧用 sin 波动态画亮度,自然眨眼效果 */
+  if (TWINKLE && TWINKLE.length){
+    var tNow = (typeof performance!=='undefined' ? performance.now() : Date.now()) * 0.001;
+    for (var ti=0; ti<TWINKLE.length; ti++){
+      var s = TWINKLE[ti];
+      var v = s.base + s.amp * Math.sin(tNow * s.speed + s.phase);   // 亮度 0~1
+      v = Math.max(0, Math.min(1, v));
+      var alpha = (v*0.95).toFixed(3);
+      // 亮度越高越白; 极暗时不画 (自然消失感)
+      if (v < 0.08) continue;
+      X.fillStyle = v > 0.75 ? "rgba(255,255,255,"+alpha+")" : (v > 0.4 ? "rgba(220,220,220,"+alpha+")" : "rgba(140,140,140,"+alpha+")");
+      X.fillRect(s.x, s.y, 1, 1);
+      // 偶尔出现的"亮星":高峰时画十字光芒
+      if (v > 0.92 && s.bigChance > 0.6){
+        X.fillStyle = "rgba(255,255,255,"+(alpha*0.55)+")";
+        X.fillRect(s.x-1, s.y, 1, 1);
+        X.fillRect(s.x+1, s.y, 1, 1);
+        X.fillRect(s.x, s.y-1, 1, 1);
+        X.fillRect(s.x, s.y+1, 1, 1);
+      }
+    }
+  }
 
   /* 聚光灯光池，随节拍呼吸 */
   X.fillStyle = "rgba(255,255,255,.30)";
