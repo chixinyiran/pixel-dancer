@@ -115,6 +115,7 @@
 
 <div class="stage">
   <canvas id="c" width="320" height="180" aria-label="黑白像素风格的迈克尔·杰克逊跳舞动画"></canvas>
+<audio id="mainPlayer" playsinline webkit-playsinline preload="auto" style="display:none"></audio>
 </div>
 
 <div class="console">
@@ -347,8 +348,12 @@ function _gotoNextSong(){
     for(var k=0;k<btns.length;k++) btns[k].className = 'trk';
     if(btns[nextIdx]) btns[nextIdx].className = 'trk on';
   }catch(e){}
-  window._crossfadeIn = true;   /* 用 window. 显式全局, 避开严格模式裸变量报错 */
-  playReal(nextIdx, 0);
+  if (useTagAudio){
+    _playSongViaTag(nextIdx);   /* [BG-REWRITE] <audio> 标签连播 */
+  } else {
+    window._crossfadeIn = true;
+    playReal(nextIdx, 0);
+  }
   _updateMediaSession();
 }
 function _startRealBuf(buf, offset){
@@ -397,6 +402,54 @@ function _startRealBuf(buf, offset){
   }
   try{ realSrc.start(0, off); }catch(e){ try{ realSrc.start(0); }catch(e2){} }
 }
+/* ========== [BG-REWRITE] <audio> 标签播放引擎 ==========
+   原 Web Audio decodeAudioData + AudioBufferSource 方案后台会被系统挂起(后台不播放/沙沙声).
+   改用 <audio> 标签直接播内嵌 webm/opus data URI: 系统媒体框架级播放, 后台/锁屏可靠.
+   舞蹈对拍改用 mainAudio.currentTime. 参考 miaoda_dance 成熟后台方案. */
+var mainAudio = null;
+var useTagAudio = true;   /* 用 <audio> 标签播内置歌(true) */
+var _tagPlayToken = 0;
+function _ensureMainAudio(){
+  if(!mainAudio){
+    mainAudio = document.getElementById('mainPlayer') || new Audio();
+    mainAudio.preload = 'auto';
+    mainAudio.setAttribute('playsinline','');
+    mainAudio.setAttribute('webkit-playsinline','');
+    mainAudio.loop = false;   /* 连播: 不单曲循环, ended 切下一首 */
+    /* 连播驱动: ended 事件(系统媒体框架触发, 后台可靠) */
+    mainAudio.addEventListener('ended', function(){
+      if(!playing || userAudio) return;
+      var now = Date.now();
+      if(window._lastTagEnded && (now - window._lastTagEnded) < 600) return;  /* 防抖 */
+      window._lastTagEnded = now;
+      _gotoNextSong();
+    });
+    mainAudio.addEventListener('play', function(){
+      if('mediaSession' in navigator){ try{ navigator.mediaSession.playbackState='playing'; }catch(e){} }
+    });
+    mainAudio.addEventListener('error', function(){
+      /* <audio> 播放失败 → 回退 Web Audio decode 方案 */
+      useTagAudio = false;
+    });
+  }
+  return mainAudio;
+}
+function _playSongViaTag(i){
+  _ensureMainAudio();
+  var myToken = ++_tagPlayToken;
+  mainAudio.loop = false;
+  try{
+    mainAudio.src = SONGAUDIO[i];
+    mainAudio.currentTime = 0;
+    mainAudio.volume = (volEl ? volEl.value/100 : 0.7);
+    var pr = mainAudio.play();
+    if(pr && pr.catch) pr.catch(function(e){
+      if(e && e.name === 'NotSupportedError'){ useTagAudio = false; }  /* 浏览器不支持 → 回退 */
+    });
+  }catch(e){ useTagAudio = false; }
+}
+function _stopTagAudio(){ if(mainAudio){ try{ mainAudio.pause(); }catch(e){} } }
+
 function playReal(i, offset){
   initAudio(); if(!ctx){ realFailed=true; return; }
   if(ctx.state==='suspended') ctx.resume();
@@ -970,12 +1023,18 @@ function setPlaying(v){
     initAudio();
     /* [FIX] 强制等待 ctx.resume() 完成再播放，否则 Chrome autoplay 策略下 ctx 仍是 suspended → 音频静音 */
     var afterResume = function(){
-      startLoop();   /* [FIX] 兜底拉起 rAF 循环 (visibilitychange 竞态时 startLoop 调用未生效) */
-      _startKeepAlive();        /* [BG] 启动静音保活, 让系统放行后台音频 */
-      _updateMediaSession();    /* [BG] 标记正在播放 */
-      if (realFailed){                     // 真实歌曲不可解码 → 退回合成器
+      startLoop();
+      _updateMediaSession();
+      if (useTagAudio){
+        /* [BG-REWRITE] 主路径: <audio> 标签播放(后台可靠) */
+        if (mainAudio && mainAudio.src && mainAudio.paused && mainAudio.currentTime > 0){
+          var pr = mainAudio.play(); if(pr&&pr.catch)pr.catch(function(){});  /* 暂停后继续 */
+        } else {
+          _playSongViaTag(curTrack);  /* 从头播 */
+        }
+      } else if (realFailed){
         startClock(); if (!schedTimer) schedTimer = setInterval(scheduler, 70);
-      } else if (!realSrc){                 // 尚未在播 → 播放本曲（从头）
+      } else if (!realSrc){
         playReal(curTrack, 0);
       }
     };
@@ -988,9 +1047,9 @@ function setPlaying(v){
   } else {
     if (schedTimer){ clearInterval(schedTimer); schedTimer = 0; }
     _clearNextTimer();
-    _stopKeepAlive();    /* [BG] 暂停时停保活 */
+    _stopTagAudio();     /* [BG-REWRITE] 暂停 <audio> 标签 */
     if ('mediaSession' in navigator){ try{ navigator.mediaSession.playbackState="paused"; }catch(e){} }
-    if (ctx) ctx.suspend();
+    /* 注: 不 suspend ctx, 合成器走 ctx; <audio> 独立于 ctx */
   }
 }
 playBtn.addEventListener("click", function(){ setPlaying(!playing); });
@@ -998,6 +1057,7 @@ C.addEventListener("click", function(){ setPlaying(!playing); });
 volEl.addEventListener("input", function(){
   if (master) master.gain.value = volEl.value / 100;
   if (userAudio) userAudio.volume = volEl.value / 100;
+  if (mainAudio) mainAudio.volume = volEl.value / 100;   /* [BG-REWRITE] 同步 <audio> 音量 */
 });
 for (var ti=0; ti<trkBtns.length; ti++){
   trkBtns[ti].addEventListener("click", function(){
@@ -1009,11 +1069,14 @@ for (var ti=0; ti<trkBtns.length; ti++){
     for (var k=0;k<trkBtns.length;k++) trkBtns[k].className = "trk";
     this.className = "trk on";
     curTrack = i;                   // 切歌：从头起拍
-    if (!userAudio && !realFailed) stopReal();   // 丢弃旧曲音源(stopReal 内已清理 nextTimer)
+    if (useTagAudio){ _stopTagAudio(); }   /* [BG-REWRITE] 切歌停旧 <audio> */
+    else if (!userAudio && !realFailed) stopReal();
     if (!playing) setPlaying(true);
     else if (userAudio) { /* 导入模式：单一音源 */ }
-    else if (realFailed) startClock();           // 合成器模式：重置拍点
-    else playReal(i, 0);                          // 真实歌曲：切到该曲从头
+    else if (useTagAudio) _playSongViaTag(i);     /* [BG-REWRITE] <audio> 切到该曲 */
+    else if (realFailed) startClock();
+    else playReal(i, 0);
+    _updateMediaSession();
   });
 }
 /* 本地原曲模式：导入后舞步按所选曲目 BPM 跟随音频时钟 */
@@ -1105,6 +1168,8 @@ function getBeats(){
   var bpm = SONGS[curTrack].bpm;
   if (userAudio && playing)
     return Math.max(0, (userAudio.currentTime + beatOffset)) * bpm / 60;
+  if (useTagAudio && mainAudio && playing && !mainAudio.paused)   /* [BG-REWRITE] <audio> 按播放位置对拍 */
+    return Math.max(0, mainAudio.currentTime) * bpm / 60;
   if (realSrc && playing && realDur){            // 真实歌曲：按音频播放位置取拍，保证舞步对拍
     var pos = (((ctx.currentTime - realStart) % realDur) + realDur) % realDur;
     return pos * bpm / 60;
